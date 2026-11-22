@@ -12,19 +12,19 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 
-from .config import World3DPolicyConfig
+from .config import KOPALConfig
 from .interface import SubgoalTrajectoryBuffer
 from .planner import ObjectTrajectoryCEMPlanner, PlanningResult
 from .policy import MeanFlowPointPolicy
 from .world_model import ObjectPointFlowWorldModel
 
 
-class WorldPolicySystem(nn.Module):
+class KOPALSystem(nn.Module):
     """组合可独立训练的世界模型、CEM 规划器、轨迹缓冲器和执行策略。"""
 
-    def __init__(self, config: Optional[World3DPolicyConfig] = None) -> None:
+    def __init__(self, config: Optional[KOPALConfig] = None) -> None:
         super().__init__()
-        self.config = config or World3DPolicyConfig()
+        self.config = config or KOPALConfig()
         self.world_model = ObjectPointFlowWorldModel(self.config.world_model)
         self.policy = MeanFlowPointPolicy(self.config.policy)
         self.policy_ema = copy.deepcopy(self.policy)

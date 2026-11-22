@@ -4,14 +4,14 @@
 子目标轨迹接口，供训练、推理和外部调用统一使用。
 """
 
-from .config import World3DPolicyConfig
+from .config import KOPALConfig
 from .world_model import PointFlowWorldModel
 from .policy import MeanFlowPointPolicy
 from .planner import ObjectTrajectoryCEMPlanner
 from .interface import SubgoalTrajectoryBuffer
 
 __all__ = [
-    "World3DPolicyConfig",
+    "KOPALConfig",
     "PointFlowWorldModel",
     "MeanFlowPointPolicy",
     "ObjectTrajectoryCEMPlanner",

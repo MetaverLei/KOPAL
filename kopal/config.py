@@ -99,7 +99,7 @@ class PlannerConfig:
 
 
 @dataclass
-class World3DPolicyConfig:
+class KOPALConfig:
     object_count: int = 2
     object_points: int = 64
     scene_points: int = 256

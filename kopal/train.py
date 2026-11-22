@@ -14,14 +14,14 @@ from typing import Dict
 import torch
 from torch.utils.data import DataLoader
 
-from .config import World3DPolicyConfig
+from .config import KOPALConfig
 from .dataset import (
     SlidingWindowTrajectoryDataset,
     collate_trajectory_samples,
     load_npz_trajectory_dataset,
     make_synthetic_dataset,
 )
-from .system import WorldPolicySystem
+from .system import KOPALSystem
 
 
 def seed_everything(seed: int) -> None:
@@ -31,7 +31,7 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def build_dataset(args: argparse.Namespace, config: World3DPolicyConfig) -> SlidingWindowTrajectoryDataset:
+def build_dataset(args: argparse.Namespace, config: KOPALConfig) -> SlidingWindowTrajectoryDataset:
     if args.data is None:
         tensors = make_synthetic_dataset(
             objects=config.object_count,
@@ -53,7 +53,7 @@ def build_dataset(args: argparse.Namespace, config: World3DPolicyConfig) -> Slid
 
 def stage_train(args: argparse.Namespace) -> Dict[str, float]:
     seed_everything(args.seed)
-    config = World3DPolicyConfig(device=args.device)
+    config = KOPALConfig(device=args.device)
     dataset = build_dataset(args, config)
     loader = DataLoader(
         dataset,
@@ -62,7 +62,7 @@ def stage_train(args: argparse.Namespace) -> Dict[str, float]:
         num_workers=0,
         collate_fn=collate_trajectory_samples,
     )
-    system = WorldPolicySystem(config).to(args.device)
+    system = KOPALSystem(config).to(args.device)
     model = system.world_model if args.stage == "world" else system.policy
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1.0e-5)
     if args.stage == "policy":

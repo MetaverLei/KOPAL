@@ -4,6 +4,8 @@ KOPAL（Key-Object Point-cloud Action Link）是一个分层机器人操作模�
 
 世界模型与策略之间只传递形状为 `(B, H, O, N, 3)` 的关键物体点云轨迹，不在接口中插入潜变量或图像子目标。
 
+代码仓库：[MetaverLei/KOPAL](https://github.com/MetaverLei/KOPAL.git)
+
 ## 模型结构
 
 ```text
@@ -55,19 +57,19 @@ MeanFlow 策略的输入包括：
 
 | 文件 | 作用 |
 |---|---|
-| `world3dp/config.py` | 编码器、世界模型、策略、规划器和感知配置 |
-| `world3dp/geometry.py` | SO(3)/SE(3)、刚体变换、PCA 规范坐标、固定点对应和点云采样 |
-| `world3dp/dataset.py` | 轨迹数据结构、滑动窗口、NPZ 读写和合成数据生成 |
-| `world3dp/modules.py` | 点云编码器、特征传播、时间编码、注意力和条件 Transformer 块 |
-| `world3dp/world_model.py` | 关键物体点流世界模型与 JEPA 训练目标 |
-| `world3dp/planner.py` | 物体级 SE(3) CEM 规划器 |
-| `world3dp/interface.py` | 世界模型到策略的子目标轨迹缓冲接口 |
-| `world3dp/policy.py` | 1-NFE MeanFlow 动作策略 |
-| `world3dp/system.py` | 世界模型、规划器、轨迹缓冲与策略的统一组合 |
-| `world3dp/perception.py` | RGB-D 反投影、Grounding DINO 检测、SAM2 分割和点云融合 |
-| `world3dp/metaworld_task.py` | MetaWorld 环境适配和脚本专家数据采集 |
-| `world3dp/metaworld_train.py` | MetaWorld 数据生成、训练与闭环评估命令 |
-| `world3dp/train.py` | 基于本地轨迹数据的分阶段训练命令 |
+| `kopal/config.py` | 编码器、世界模型、策略、规划器和感知配置 |
+| `kopal/geometry.py` | SO(3)/SE(3)、刚体变换、PCA 规范坐标、固定点对应和点云采样 |
+| `kopal/dataset.py` | 轨迹数据结构、滑动窗口、NPZ 读写和合成数据生成 |
+| `kopal/modules.py` | 点云编码器、特征传播、时间编码、注意力和条件 Transformer 块 |
+| `kopal/world_model.py` | 关键物体点流世界模型与 JEPA 训练目标 |
+| `kopal/planner.py` | 物体级 SE(3) CEM 规划器 |
+| `kopal/interface.py` | 世界模型到策略的子目标轨迹缓冲接口 |
+| `kopal/policy.py` | 1-NFE MeanFlow 动作策略 |
+| `kopal/system.py` | 世界模型、规划器、轨迹缓冲与策略的统一组合 |
+| `kopal/perception.py` | RGB-D 反投影、Grounding DINO 检测、SAM2 分割和点云融合 |
+| `kopal/metaworld_task.py` | MetaWorld 环境适配和脚本专家数据采集 |
+| `kopal/metaworld_train.py` | MetaWorld 数据生成、训练与闭环评估命令 |
+| `kopal/train.py` | 基于本地轨迹数据的分阶段训练命令 |
 
 ## 数据格式
 
@@ -94,8 +96,16 @@ MeanFlow 策略的输入包括：
 
 ## 安装
 
+克隆代码仓库：
+
 ```powershell
-cd E:\Study\yan\project\KOPAL\KOPAL
+git clone https://github.com/MetaverLei/KOPAL.git
+cd KOPAL
+```
+
+安装运行依赖：
+
+```powershell
 python -m pip install -r requirements.txt
 python -m pip install -e .
 ```
@@ -113,8 +123,8 @@ python -m pip install -e ".[perception]"
 使用 NPZ 数据分阶段训练世界模型和策略：
 
 ```powershell
-python -m world3dp.train --stage world --data data/train.npz --steps 1000 --output outputs/world.pt
-python -m world3dp.train --stage policy --data data/train.npz --steps 1000 --output outputs/policy.pt
+python -m kopal.train --stage world --data data/train.npz --steps 1000 --output outputs/world.pt
+python -m kopal.train --stage policy --data data/train.npz --steps 1000 --output outputs/policy.pt
 ```
 
 未提供 `--data` 时，训练入口使用确定性合成轨迹检查计算图和数据流。
@@ -126,13 +136,13 @@ python -m world3dp.train --stage policy --data data/train.npz --steps 1000 --out
 ### 采集脚本专家数据
 
 ```powershell
-python -m world3dp.metaworld_train --mode generate --task-name reach-v3 --episodes 20 --seed 7
+python -m kopal.metaworld_train --mode generate --task-name reach-v3 --episodes 20 --seed 7
 ```
 
 ### 分阶段训练
 
 ```powershell
-python -m world3dp.metaworld_train --mode train --task-name reach-v3 --world-epochs 60 --policy-epochs 1000
+python -m kopal.metaworld_train --mode train --task-name reach-v3 --world-epochs 60 --policy-epochs 1000
 ```
 
 训练入口支持以下关键参数：
@@ -150,7 +160,7 @@ python -m world3dp.metaworld_train --mode train --task-name reach-v3 --world-epo
 ### 闭环评估
 
 ```powershell
-python -m world3dp.metaworld_train --mode eval --task-name reach-v3 --checkpoint KOPAL_train/outputs/reach_v3/latest.pt --eval-episodes 20 --eval-seed 10000
+python -m kopal.metaworld_train --mode eval --task-name reach-v3 --checkpoint KOPAL_train/outputs/reach_v3/latest.pt --eval-episodes 20 --eval-seed 10000
 ```
 
 评估参数包括：
@@ -166,11 +176,11 @@ python -m world3dp.metaworld_train --mode eval --task-name reach-v3 --checkpoint
 ```python
 import torch
 
-from world3dp import World3DPolicyConfig
-from world3dp.system import WorldPolicySystem
+from kopal import KOPALConfig
+from kopal.system import KOPALSystem
 
-config = World3DPolicyConfig(device="cuda")
-system = WorldPolicySystem(config).to(config.device)
+config = KOPALConfig(device="cuda")
+system = KOPALSystem(config).to(config.device)
 
 system.update_subgoal(
     current_objects=torch.randn(1, 2, 64, 3, device=config.device),

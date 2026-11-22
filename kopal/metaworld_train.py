@@ -17,7 +17,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from .config import EncoderConfig, PlannerConfig, PolicyConfig, World3DPolicyConfig, WorldModelConfig
+from .config import EncoderConfig, PlannerConfig, PolicyConfig, KOPALConfig, WorldModelConfig
 from .dataset import (
     SlidingWindowTrajectoryDataset,
     collate_trajectory_samples,
@@ -29,18 +29,18 @@ from .metaworld_task import (
     MetaWorldButtonPressAdapter,
     collect_button_press_dataset,
 )
-from .system import WorldPolicySystem
+from .system import KOPALSystem
 
 
 def repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    return Path(__file__).resolve().parents[1]
 
 
 def default_training_root() -> Path:
     return repo_root() / "KOPAL_train"
 
 
-def build_config(device: str) -> World3DPolicyConfig:
+def build_config(device: str) -> KOPALConfig:
     encoder = EncoderConfig(
         point_hidden_dims=(64, 128),
         token_dim=128,
@@ -55,7 +55,7 @@ def build_config(device: str) -> World3DPolicyConfig:
         abstract_points=(16, 8),
         knn=12,
     )
-    return World3DPolicyConfig(
+    return KOPALConfig(
         object_count=1,
         object_points=64,
         scene_points=256,
@@ -111,7 +111,7 @@ def seed_everything(seed: int) -> None:
     torch.backends.cudnn.allow_tf32 = True
 
 
-def build_dataset(path: Path, config: World3DPolicyConfig) -> SlidingWindowTrajectoryDataset:
+def build_dataset(path: Path, config: KOPALConfig) -> SlidingWindowTrajectoryDataset:
     tensors = load_npz_trajectory_dataset(path)
     if tensors.actions.shape[-1] != config.policy.action_dim:
         raise ValueError("Dataset action dimension does not match policy config")
@@ -134,8 +134,8 @@ def append_jsonl(path: Path, value: Dict) -> None:
 
 def save_checkpoint(
     path: Path,
-    system: WorldPolicySystem,
-    config: World3DPolicyConfig,
+    system: KOPALSystem,
+    config: KOPALConfig,
     policy_epoch: int,
     action_mean: torch.Tensor,
     action_std: torch.Tensor,
@@ -161,7 +161,7 @@ def save_checkpoint(
 
 def load_checkpoint(
     path: Path,
-    system: WorldPolicySystem,
+    system: KOPALSystem,
     use_ema: bool = False,
 ) -> Dict:
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
@@ -216,7 +216,7 @@ def train(
         collate_fn=collate_trajectory_samples,
         drop_last=False,
     )
-    system = WorldPolicySystem(config).to(device)
+    system = KOPALSystem(config).to(device)
     action_mean, action_std = dataset.action_stats
     action_min, action_max = dataset.action_bounds
     action_mean, action_std = action_mean.to(device), action_std.to(device)
@@ -345,7 +345,7 @@ def _move_observation(observation: ButtonObservation, device: str) -> ButtonObse
 
 
 def _update_subgoal(
-    system: WorldPolicySystem,
+    system: KOPALSystem,
     observation: ButtonObservation,
     approach_threshold: float,
     horizon: int,
@@ -410,7 +410,7 @@ def _update_subgoal(
 def evaluate(args: argparse.Namespace) -> Dict[str, float]:
     device = args.device
     config = build_config(device)
-    system = WorldPolicySystem(config).to(device)
+    system = KOPALSystem(config).to(device)
     checkpoint = load_checkpoint(
         Path(args.checkpoint),
         system,
