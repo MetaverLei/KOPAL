@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kopal"
+version = "0.1.0"
+description = "KOPAL 分层点云世界模型与动作策略"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.4",
+  "numpy>=1.24",
+  "tqdm>=4.66",
+  "metaworld>=3.0",
+  "gymnasium>=1.1",
+  "mujoco>=3.3",
+]
+
+[project.optional-dependencies]
+perception = [
+  "transformers>=4.45",
+  "pillow>=10.0",
+]
+[tool.setuptools.packages.find]
+include = ["world3dp*"]
+
