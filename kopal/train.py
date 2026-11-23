@@ -64,6 +64,10 @@ def stage_train(args: argparse.Namespace) -> Dict[str, float]:
     )
     system = KOPALSystem(config).to(args.device)
     model = system.world_model if args.stage == "world" else system.policy
+    if args.stage == "world":
+        # 基于步数的训练器没有 epoch 循环，将首个逻辑轮次设为 1，
+        # 使默认的零轮 warmup 在第一次更新时即启用 JEPA 目标。
+        system.world_model.set_epoch(1)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1.0e-5)
     if args.stage == "policy":
         mean, std = dataset.action_stats

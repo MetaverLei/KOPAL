@@ -27,6 +27,7 @@ from .geometry import (
 from .modules import (
     ConditionalTransformerBlock,
     PointNet2Encoder,
+    SketchIsotropicGaussianRegularizer,
     masked_smooth_l1,
     mlp,
     sinusoidal_time_embedding,
@@ -45,6 +46,8 @@ class ObjectPointFlowWorldModel(nn.Module):
     def __init__(self, config: Optional[WorldModelConfig] = None) -> None:
         super().__init__()
         self.config = config or WorldModelConfig()
+        # 单独调用损失函数时默认启用非 warmup 目标，训练入口会通过 set_epoch 更新。
+        self.current_epoch = 1
         self.encoder = PointNet2Encoder(self.config.encoder)
         in_dim = self.config.encoder.token_dim
         object_dim = self.config.object_dim
@@ -70,6 +73,14 @@ class ObjectPointFlowWorldModel(nn.Module):
             self.config.jepa_dim,
             layers=2,
         )
+        self.sigreg = (
+            SketchIsotropicGaussianRegularizer(
+                knots=self.config.sigreg_knots,
+                num_proj=self.config.sigreg_num_proj,
+            )
+            if self.config.sigreg_weight > 0.0
+            else None
+        )
         if self.config.use_jepa:
             self.target_encoder = copy.deepcopy(self.encoder)
             self.target_latent_projector = copy.deepcopy(self.latent_projector)
@@ -87,6 +98,10 @@ class ObjectPointFlowWorldModel(nn.Module):
             self.target_encoder.eval()
             self.target_latent_projector.eval()
         return self
+
+    def set_epoch(self, epoch: int) -> None:
+        """设置训练轮次，用于控制损失项的 warmup 计划。"""
+        self.current_epoch = int(epoch)
 
     @staticmethod
     def _expand_leading(points: torch.Tensor) -> tuple[torch.Tensor, bool]:
@@ -135,7 +150,8 @@ class ObjectPointFlowWorldModel(nn.Module):
         if point_mask is None:
             point_mask = torch.ones(b, o, n, dtype=torch.bool, device=current_objects.device)
 
-        canonical = canonicalize_objects(current_objects, object_mask & point_mask.any(dim=-1))
+        valid_object_mask = object_mask & point_mask.any(dim=-1)
+        canonical = canonicalize_objects(current_objects, valid_object_mask)
         local_points = canonical.points
         world_rotation, world_translation = action_6d_to_rt(actions)
         local_rotation, local_translation = world_action_to_local(
@@ -152,7 +168,7 @@ class ObjectPointFlowWorldModel(nn.Module):
         )
         object_tokens = point_tokens.max(dim=-2).values + action_context
         object_tokens = self.object_norm(object_tokens)
-        invalid_object_mask = ~object_mask
+        invalid_object_mask = ~valid_object_mask
         for block in self.object_context:
             object_tokens = block(
                 object_tokens,
@@ -187,6 +203,7 @@ class ObjectPointFlowWorldModel(nn.Module):
         if return_latent:
             valid_points = point_mask.any(dim=-1).to(predicted_local.dtype).unsqueeze(-1)
             _, future_embedding = self._encode_objects(predicted_local, point_mask)
+            output["predicted_encoder_feature"] = future_embedding * valid_points
             output["predicted_embedding"] = self.latent_projector(future_embedding) * valid_points
         return output
 
@@ -258,6 +275,7 @@ class ObjectPointFlowWorldModel(nn.Module):
         predictions = []
         residuals = []
         predicted_embeddings = []
+        predicted_encoder_features = []
         for k in range(t):
             output = self.step(
                 current[:, k],
@@ -270,6 +288,7 @@ class ObjectPointFlowWorldModel(nn.Module):
             residuals.append(output["residual"])
             if return_latent:
                 predicted_embeddings.append(output["predicted_embedding"])
+                predicted_encoder_features.append(output["predicted_encoder_feature"])
 
         result = {
             "next_objects": torch.stack(predictions, dim=1),
@@ -278,6 +297,9 @@ class ObjectPointFlowWorldModel(nn.Module):
         }
         if return_latent:
             result["predicted_embedding"] = torch.stack(predicted_embeddings, dim=1)
+            result["predicted_encoder_feature"] = torch.stack(
+                predicted_encoder_features, dim=1
+            )
         return result
 
     def compute_loss(
@@ -325,34 +347,187 @@ class ObjectPointFlowWorldModel(nn.Module):
             losses["wm_rigid_loss"] = rigid
 
         if use_latent:
-            canonical_target = canonicalize_objects(target, object_mask & point_mask.any(dim=-1))
-            with torch.no_grad():
-                _, target_feature = self._encode_objects(canonical_target.points, point_mask, use_target=True)
-                target_embedding = self.target_latent_projector(target_feature)
-                target_embedding = F.normalize(target_embedding, dim=-1)
-            predicted_embedding = F.normalize(output["predicted_embedding"], dim=-1)
-            valid_objects = object_mask.to(predicted_embedding.dtype).unsqueeze(-1)
-            token_loss = ((predicted_embedding - target_embedding).square().sum(dim=-1, keepdim=True) * valid_objects).sum()
-            token_loss = token_loss / valid_objects.sum().clamp_min(1.0)
-            total = total + self.config.jepa_loss_weight * token_loss
-            losses["wm_jepa_loss"] = token_loss
+            # 预测点位于当前物体的规范坐标中，未来目标也必须使用当前物体的
+            # 规范坐标。若对目标独立执行 PCA 规范化，会消除刚体相对运动。
+            valid_object_mask = object_mask & point_mask.any(dim=-1)
+            current_canonical = canonicalize_objects(current, valid_object_mask)
+            target_in_current_frame = current_canonical.to_local(target)
+            if self.config.jepa_use_ema_target:
+                with torch.no_grad():
+                    _, target_feature = self._encode_objects(
+                        target_in_current_frame,
+                        point_mask,
+                        use_target=True,
+                    )
+                    target_raw_embedding = self.target_latent_projector(target_feature)
+                online_target_feature = None
+                if self.config.regularize_target_feature:
+                    _, online_target_feature = self._encode_objects(
+                        target_in_current_frame,
+                        point_mask,
+                        use_target=False,
+                    )
+            else:
+                _, online_target_feature = self._encode_objects(
+                    target_in_current_frame,
+                    point_mask,
+                    use_target=False,
+                )
+                target_raw_embedding = self.latent_projector(online_target_feature)
 
-            flat_embedding = predicted_embedding.reshape(-1, predicted_embedding.shape[-1])
-            flat_valid = object_mask.reshape(-1)
-            flat_embedding = flat_embedding[flat_valid]
-            if flat_embedding.shape[0] > 1:
-                std = torch.sqrt(flat_embedding.var(dim=0, unbiased=False) + 1.0e-4)
-                variance_loss = F.relu(1.0 - std).mean()
-                centered = flat_embedding - flat_embedding.mean(dim=0, keepdim=True)
-                covariance = centered.transpose(-1, -2) @ centered / max(flat_embedding.shape[0] - 1, 1)
-                off_diagonal = covariance - torch.diag_embed(covariance.diagonal())
-                covariance_loss = off_diagonal.square().sum() / flat_embedding.shape[-1]
+            target_embedding = F.normalize(target_raw_embedding, dim=-1)
+            predicted_raw_embedding = output["predicted_embedding"]
+            predicted_embedding = F.normalize(predicted_raw_embedding, dim=-1)
+            valid_objects = valid_object_mask.to(
+                predicted_embedding.dtype
+            ).unsqueeze(-1)
+            if self.config.jepa_normalize:
+                token_error = (
+                    predicted_embedding - target_embedding
+                ).square().sum(dim=-1, keepdim=True)
+            else:
+                token_error = (
+                    predicted_raw_embedding - target_raw_embedding
+                ).square().mean(dim=-1, keepdim=True)
+            token_loss = (token_error * valid_objects).sum()
+            token_loss = token_loss / valid_objects.sum().clamp_min(1.0)
+            jepa_active = self.current_epoch > self.config.jepa_warmup_epochs
+            jepa_weight = self.config.jepa_loss_weight if jepa_active else 0.0
+            total = total + jepa_weight * token_loss
+            losses["wm_jepa_loss"] = token_loss
+            losses["wm_jepa_weight"] = torch.as_tensor(
+                jepa_weight,
+                device=token_loss.device,
+                dtype=token_loss.dtype,
+            )
+
+            regularized_embedding = (
+                predicted_raw_embedding
+                if self.config.latent_regularizer_on_raw
+                else predicted_embedding
+            )
+            regularized_embeddings = [regularized_embedding]
+            if self.config.regularize_encoder_feature:
+                regularized_embeddings.append(output["predicted_encoder_feature"])
+            if self.config.regularize_target_feature:
+                if online_target_feature is None:
+                    _, online_target_feature = self._encode_objects(
+                        target_in_current_frame,
+                        point_mask,
+                        use_target=False,
+                    )
+                regularized_embeddings.append(online_target_feature)
+
+            flat_valid = valid_object_mask.reshape(-1)
+            flat_embeddings = []
+            for embedding in regularized_embeddings:
+                flat = embedding.reshape(-1, embedding.shape[-1])
+                flat_embeddings.append(flat[flat_valid])
+
+            if flat_embeddings[0].shape[0] > 1:
+                std_values = [
+                    torch.sqrt(flat.var(dim=0, unbiased=False) + 1.0e-4)
+                    for flat in flat_embeddings
+                ]
+                variance_losses = []
+                covariance_losses = []
+                normalized_variance_losses = []
+                normalized_covariance_losses = []
+                for flat, std in zip(flat_embeddings, std_values):
+                    variance_losses.append(F.relu(1.0 - std).mean())
+                    centered = flat - flat.mean(dim=0, keepdim=True)
+                    covariance = centered.transpose(-1, -2) @ centered / max(
+                        flat.shape[0] - 1,
+                        1,
+                    )
+                    off_diagonal = covariance - torch.diag_embed(
+                        covariance.diagonal()
+                    )
+                    covariance_losses.append(
+                        off_diagonal.square().sum()
+                        / max(flat.shape[-1] - 1, 1)
+                        / flat.shape[-1]
+                    )
+
+                    normalized = F.normalize(flat, dim=-1)
+                    normalized_std = torch.sqrt(
+                        normalized.var(dim=0, unbiased=False) + 1.0e-4
+                    )
+                    normalized_variance_losses.append(
+                        F.relu(
+                            self.config.normalized_std_margin - normalized_std
+                        ).mean()
+                    )
+                    normalized_centered = normalized - normalized.mean(
+                        dim=0,
+                        keepdim=True,
+                    )
+                    normalized_covariance = (
+                        normalized_centered.transpose(-1, -2)
+                        @ normalized_centered
+                        / max(normalized.shape[0] - 1, 1)
+                    )
+                    normalized_off_diagonal = (
+                        normalized_covariance
+                        - torch.diag_embed(normalized_covariance.diagonal())
+                    )
+                    normalized_covariance_losses.append(
+                        normalized_off_diagonal.square().sum()
+                        / max(normalized.shape[-1] - 1, 1)
+                        / normalized.shape[-1]
+                    )
+
+                variance_loss = torch.stack(variance_losses).mean()
+                covariance_loss = torch.stack(covariance_losses).mean()
+                normalized_variance_loss = torch.stack(
+                    normalized_variance_losses
+                ).mean()
+                normalized_covariance_loss = torch.stack(
+                    normalized_covariance_losses
+                ).mean()
                 if self.config.latent_variance_weight > 0.0:
-                    total = total + self.config.latent_variance_weight * variance_loss
+                    total = (
+                        total
+                        + self.config.latent_variance_weight * variance_loss
+                    )
                 if self.config.latent_covariance_weight > 0.0:
-                    total = total + self.config.latent_covariance_weight * covariance_loss
+                    total = (
+                        total
+                        + self.config.latent_covariance_weight * covariance_loss
+                    )
+                if self.config.normalized_variance_weight > 0.0:
+                    total = (
+                        total
+                        + self.config.normalized_variance_weight
+                        * normalized_variance_loss
+                    )
+                if self.config.normalized_covariance_weight > 0.0:
+                    total = (
+                        total
+                        + self.config.normalized_covariance_weight
+                        * normalized_covariance_loss
+                    )
+
                 losses["wm_variance_loss"] = variance_loss
                 losses["wm_covariance_loss"] = covariance_loss
+                losses["wm_normalized_variance_loss"] = normalized_variance_loss
+                losses["wm_normalized_covariance_loss"] = normalized_covariance_loss
+                losses["wm_latent_std_mean"] = torch.stack(
+                    [std.mean() for std in std_values]
+                ).mean()
+
+                if self.sigreg is not None:
+                    chunk_size = max(self.config.sigreg_chunk_size, 2)
+                    sigreg_values = []
+                    for flat in flat_embeddings:
+                        sigreg_values.extend(
+                            self.sigreg(chunk.unsqueeze(0))
+                            for chunk in flat.split(chunk_size, dim=0)
+                            if chunk.shape[0] > 1
+                        )
+                    sigreg_loss = torch.stack(sigreg_values).mean()
+                    total = total + self.config.sigreg_weight * sigreg_loss
+                    losses["wm_sigreg_loss"] = sigreg_loss
         losses["wm_total_loss"] = total
         return total, losses
 

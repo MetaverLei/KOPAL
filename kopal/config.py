@@ -32,11 +32,24 @@ class WorldModelConfig:
     use_jepa: bool = True
     jepa_dim: int = 192
     ema_momentum: float = 0.995
+    jepa_use_ema_target: bool = True
+    jepa_warmup_epochs: int = 0
     flow_loss_weight: float = 1.0
-    jepa_loss_weight: float = 0.1
+    jepa_loss_weight: float = 1.0
+    jepa_normalize: bool = False
     rigid_loss_weight: float = 0.0
-    latent_variance_weight: float = 0.01
-    latent_covariance_weight: float = 0.001
+    latent_variance_weight: float = 5.0
+    latent_covariance_weight: float = 10.0
+    latent_regularizer_on_raw: bool = True
+    regularize_encoder_feature: bool = False
+    regularize_target_feature: bool = False
+    normalized_variance_weight: float = 0.0
+    normalized_covariance_weight: float = 0.0
+    normalized_std_margin: float = 0.05
+    sigreg_weight: float = 0.09
+    sigreg_num_proj: int = 256
+    sigreg_knots: int = 17
+    sigreg_chunk_size: int = 128
 
 
 @dataclass

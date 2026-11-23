@@ -259,7 +259,9 @@ def train(
     )
     if args.world_epochs > 0 and not resume_world:
         for epoch in range(1, args.world_epochs + 1):
+            system.world_model.set_epoch(epoch)
             totals = []
+            component_totals: Dict[str, list[float]] = {}
             progress = tqdm(loader, desc=f"world {epoch}/{args.world_epochs}")
             for batch in progress:
                 batch = {name: value.to(device, non_blocking=True) for name, value in batch.items()}
@@ -269,6 +271,8 @@ def train(
                     grad_clip=args.grad_clip,
                 )
                 totals.append(losses["wm_total_loss"])
+                for name, value in losses.items():
+                    component_totals.setdefault(name, []).append(value)
                 progress.set_postfix(loss=f"{totals[-1]:.5f}")
             record = {
                 "stage": "world",
@@ -276,6 +280,12 @@ def train(
                 "loss": float(np.mean(totals)),
                 "elapsed_sec": time.time() - start,
             }
+            record.update(
+                {
+                    name: float(np.mean(values))
+                    for name, values in component_totals.items()
+                }
+            )
             append_jsonl(metrics_path, record)
             print(record)
         torch.save(

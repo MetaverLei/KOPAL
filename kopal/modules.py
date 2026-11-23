@@ -168,14 +168,29 @@ class PointNet2Encoder(nn.Module):
         per_point = self.fp1(flat_points, xyz1, up1, flat_points)
         if flat_mask is not None:
             per_point = per_point * flat_mask.to(per_point.dtype).unsqueeze(-1)
+            valid_object = flat_mask.any(dim=-1)
             global_input = per_point.masked_fill(
                 ~flat_mask.unsqueeze(-1),
                 torch.finfo(per_point.dtype).min,
             )
+            # 全部点均无效的物体不能将 dtype 最小值送入 LayerNorm，
+            # 对此类物体显式使用有限的零向量。
+            global_input = global_input.masked_fill(
+                ~valid_object.unsqueeze(-1).unsqueeze(-1),
+                0.0,
+            )
             global_feature = global_input.amax(dim=-2)
         else:
+            valid_object = torch.ones(
+                flat_points.shape[0],
+                dtype=torch.bool,
+                device=flat_points.device,
+            )
             global_feature = per_point.amax(dim=-2)
         global_feature = self.global_head(global_feature)
+        global_feature = global_feature * valid_object.to(
+            global_feature.dtype
+        ).unsqueeze(-1)
         return (
             per_point.reshape(*leading_shape, n, -1),
             global_feature.reshape(*leading_shape, -1),
@@ -299,4 +314,43 @@ def masked_smooth_l1(prediction: torch.Tensor, target: torch.Tensor, mask: Optio
         return loss.mean()
     weight = mask.to(loss.dtype)
     return (loss * weight).sum() / weight.sum().clamp_min(1.0)
+
+
+class SketchIsotropicGaussianRegularizer(nn.Module):
+    """通过随机投影约束潜变量分布的各向同性高斯正则项。
+
+    该模块在随机一维投影上计算 Epps-Pulley 特征函数统计量，使 embedding
+    的分布接近各向同性标准高斯分布。与仅约束逐维方差相比，该统计量还能
+    识别非高斯分布和低秩塌缩。
+    """
+
+    def __init__(self, knots: int = 17, num_proj: int = 256) -> None:
+        super().__init__()
+        self.num_proj = num_proj
+        t = torch.linspace(0.0, 3.0, knots, dtype=torch.float32)
+        dt = 3.0 / max(knots - 1, 1)
+        weights = torch.full((knots,), 2.0 * dt, dtype=torch.float32)
+        weights[[0, -1]] = dt
+        window = torch.exp(-0.5 * t.square())
+        self.register_buffer("t", t, persistent=False)
+        self.register_buffer("phi", window, persistent=False)
+        self.register_buffer("weights", weights * window, persistent=False)
+
+    def forward(self, projected_embeddings: torch.Tensor) -> torch.Tensor:
+        """计算形状为 ``(样本组, 样本数, 维度)`` 的 embedding 正则损失。"""
+        projection = torch.randn(
+            projected_embeddings.shape[-1],
+            self.num_proj,
+            device=projected_embeddings.device,
+            dtype=projected_embeddings.dtype,
+        )
+        projection = projection.div_(projection.norm(p=2, dim=0).clamp_min(1.0e-8))
+        projected = projected_embeddings @ projection
+        projected = projected.unsqueeze(-1) * self.t.to(projected.dtype)
+        residual = (
+            (projected.cos().mean(dim=-3) - self.phi.to(projected.dtype)).square()
+            + projected.sin().mean(dim=-3).square()
+        )
+        statistic = (residual @ self.weights.to(projected.dtype)) * projected_embeddings.size(-2)
+        return statistic.mean()
 

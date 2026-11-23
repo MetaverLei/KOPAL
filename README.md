@@ -24,8 +24,28 @@ RGB-D 点云与关键物体固定对应点
 - 使用层次点云编码器提取逐点特征和全局特征。
 - 在物体 PCA 规范坐标中预测固定对应点的未来位置。
 - 输出由显式刚体动作和神经网络残差组成。
-- 支持 JEPA 潜空间预测、目标编码器 EMA、潜变量方差和协方差正则。
+- JEPA 预测目标使用当前物体规范坐标，保留刚体相对运动。
+- 默认在原始投影空间计算 JEPA 均方误差、方差和协方差，避免单位向量归一化导致方差目标不可达。
+- 目标编码器和目标投影器使用指数滑动平均，不接收梯度。
+- SIGReg 通过随机投影上的 Epps-Pulley 统计量约束 embedding 分布接近各向同性高斯分布，抑制低秩塌缩。
 - 单步接口为 `step`，多步接口为 `rollout`，教师强制训练接口为 `forward`。
+
+默认世界模型训练目标为：
+
+```text
+loss =
+  1.0  * flow_loss
+  + 1.0  * raw_JEPA_MSE
+  + 5.0  * raw_variance_loss
+  + 10.0 * raw_covariance_loss
+  + 0.09 * SIGReg
+```
+
+训练日志分别记录 `wm_flow_loss`、`wm_jepa_loss`、`wm_jepa_weight`、
+`wm_variance_loss`、`wm_covariance_loss`、`wm_normalized_variance_loss`、
+`wm_normalized_covariance_loss`、`wm_latent_std_mean`、`wm_sigreg_loss`
+和 `wm_total_loss`。JEPA 预测损失可通过 `jepa_warmup_epochs` 设置启用轮次，
+归一化 JEPA 形式可通过 `jepa_normalize` 启用。
 
 ### 规划器
 
