@@ -1,7 +1,7 @@
 """KOPAL 世界模型、规划器和策略的异步组合。
 
-本文件提供统一系统对象，负责分阶段训练、策略指数滑动平均、子目标更新、
-轨迹缓冲和动作块推理，是训练与闭环评估的主要入口。
+本文件提供统一系统对象，负责分阶段训练、阶段辅助监督、策略指数滑动平均、
+子目标更新、轨迹缓冲和动作块推理，是训练与闭环评估的主要入口。
 """
 
 from __future__ import annotations
@@ -50,6 +50,14 @@ class KOPALSystem(nn.Module):
             actions=batch.get("world_actions"),
             object_mask=batch.get("object_mask"),
             point_mask=batch.get("point_mask"),
+            phase_id=batch.get("phase_id"),
+            phase_boundary=batch.get("phase_boundary"),
+            phase_count=batch.get("phase_count"),
+            phase_context=(
+                batch["robot_state"][:, -1]
+                if "robot_state" in batch
+                else None
+            ),
         )
         loss.backward()
         if grad_clip > 0.0:
@@ -100,6 +108,8 @@ class KOPALSystem(nn.Module):
         obstacle_points: Optional[torch.Tensor] = None,
         object_mask: Optional[torch.Tensor] = None,
         point_mask: Optional[torch.Tensor] = None,
+        phase_context: Optional[torch.Tensor] = None,
+        max_phases: Optional[int] = None,
     ) -> PlanningResult:
         result = self.planner.plan(
             current_objects,
@@ -107,6 +117,8 @@ class KOPALSystem(nn.Module):
             obstacle_points=obstacle_points,
             object_mask=object_mask,
             point_mask=point_mask,
+            phase_context=phase_context,
+            max_phases=max_phases,
         )
         self.subgoal_buffer.update(
             result.subgoal_trajectory,

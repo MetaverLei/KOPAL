@@ -1,7 +1,8 @@
 """KOPAL 关键物体点云轨迹的 SE(3) CEM 规划器。
 
 本文件在物体局部 SE(3) 空间采样候选位移，通过世界模型推演未来点云轨迹，
-再结合终点几何距离、碰撞、平滑性和物体间交互代价选择最优子目标轨迹。
+再结合终点几何距离、碰撞、平滑性、物体间交互和阶段一致性代价选择最优
+子目标轨迹，并将选中的轨迹编码为阶段化关键物体点云轨迹。
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from .geometry import (
     local_action_to_world,
     rt_to_action_6d,
 )
+from .phases import build_staged_trajectory, decode_monotonic_phases
 from .world_model import ObjectPointFlowWorldModel
 
 
@@ -33,8 +35,13 @@ class PlanningResult:
     collision_costs: torch.Tensor
     smoothness_costs: torch.Tensor
     interaction_costs: torch.Tensor
+    stage_costs: torch.Tensor
     mean: torch.Tensor
     std: torch.Tensor
+    phase_ids: Optional[torch.Tensor] = None
+    phase_boundaries: Optional[torch.Tensor] = None
+    phase_goal_points: Optional[torch.Tensor] = None
+    phase_count: Optional[torch.Tensor] = None
 
     def named(self) -> Dict[str, torch.Tensor]:
         return {
@@ -46,8 +53,13 @@ class PlanningResult:
             "collision_costs": self.collision_costs,
             "smoothness_costs": self.smoothness_costs,
             "interaction_costs": self.interaction_costs,
+            "stage_costs": self.stage_costs,
             "mean": self.mean,
             "std": self.std,
+            "phase_ids": self.phase_ids,
+            "phase_boundaries": self.phase_boundaries,
+            "phase_goal_points": self.phase_goal_points,
+            "phase_count": self.phase_count,
         }
 
 
@@ -116,7 +128,18 @@ class ObjectTrajectoryCEMPlanner:
         obstacle_points: Optional[torch.Tensor],
         object_mask: torch.Tensor,
         point_mask: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        phase_logits: Optional[torch.Tensor] = None,
+        phase_boundary_logits: Optional[torch.Tensor] = None,
+        phase_count_logits: Optional[torch.Tensor] = None,
+        max_phases: Optional[int] = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         batch, samples, horizon, objects, points, _ = trajectory.shape
         goal = goal_objects[:, None].expand(-1, samples, -1, -1, -1)
         terminal = self._symmetric_chamfer(
@@ -187,13 +210,98 @@ class ObjectTrajectoryCEMPlanner:
                 interaction_pairs * pair_mask.to(interaction_pairs.dtype)
             ).sum(dim=(-1, -2, -3)) / pair_mask.sum(dim=(-1, -2, -3)).clamp_min(1)
 
+        stage_cost = trajectory.new_zeros(batch, samples)
+        if phase_logits is not None and max_phases != 1:
+            discrete_phase = (
+                decode_monotonic_phases(
+                    phase_logits,
+                    phase_count_logits,
+                    max_phases=max_phases,
+                )
+                if phase_count_logits is not None
+                else phase_logits.argmax(dim=-1)
+            )
+            valid = object_mask[:, None, None, :].to(discrete_phase.dtype)
+            valid_points = valid.expand(-1, samples, horizon, -1)
+            valid_total = valid_points.sum(dim=-1).clamp_min(1.0)
+            if horizon > 1:
+                phase_change = (
+                    discrete_phase[:, :, 1:] != discrete_phase[:, :, :-1]
+                ).to(trajectory.dtype)
+                valid_change = valid_points[:, :, 1:]
+                nonmonotonic = F.relu(
+                    discrete_phase[:, :, :-1] - discrete_phase[:, :, 1:]
+                )
+                nonmonotonic = (
+                    nonmonotonic * valid_change
+                ).sum(dim=(-1, -2)) / valid_change.sum(
+                    dim=(-1, -2)
+                ).clamp_min(1.0)
+                if phase_boundary_logits is not None:
+                    boundary_error = F.binary_cross_entropy_with_logits(
+                        phase_boundary_logits[:, :, :-1],
+                        phase_change,
+                        reduction="none",
+                    )
+                    boundary_error = (
+                        boundary_error * valid_change
+                    ).sum(dim=(-1, -2)) / valid_change.sum(
+                        dim=(-1, -2)
+                    ).clamp_min(1.0)
+                else:
+                    boundary_error = stage_cost
+            else:
+                nonmonotonic = stage_cost
+                boundary_error = stage_cost
+
+            centres = trajectory.mean(dim=-2)
+            goal_centres = goal_objects.mean(dim=-2)[:, None]
+            distance = torch.linalg.vector_norm(
+                centres - goal_centres.unsqueeze(2),
+                dim=-1,
+            )
+            distance = (
+                distance * valid_points
+            ).sum(dim=-1) / valid_total
+            if horizon > 1:
+                progress_violation = F.relu(
+                    distance[:, :, 1:] - distance[:, :, :-1] + 1.0e-4
+                ).mean(dim=-1)
+            else:
+                progress_violation = stage_cost
+
+            if phase_count_logits is not None:
+                expected_terminal = phase_count_logits.argmax(dim=-1)
+                phase_max = discrete_phase.max(dim=2).values
+                actual_terminal = phase_max.to(trajectory.dtype).mean(dim=-1)
+                motion = torch.linalg.vector_norm(
+                    centres[:, :, -1] - centres[:, :, 0],
+                    dim=-1,
+                )
+                active_motion = (motion > 0.01).to(trajectory.dtype)
+                coverage_violation = F.relu(
+                    expected_terminal.to(trajectory.dtype).unsqueeze(-1)
+                    - actual_terminal.unsqueeze(-1)
+                ) * active_motion
+                coverage_violation = coverage_violation.mean(dim=-1)
+            else:
+                coverage_violation = stage_cost
+
+            stage_cost = (
+                nonmonotonic
+                + boundary_error
+                + progress_violation
+                + coverage_violation
+            )
+
         total = (
             self.config.translation_cost_weight * terminal
             + self.config.collision_weight * coll
             + self.config.smoothness_weight * smoothness
             + self.config.object_interaction_weight * interaction
+            + self.config.stage_cost_weight * stage_cost
         )
-        return total, terminal, coll, smoothness, interaction
+        return total, terminal, coll, smoothness, interaction, stage_cost
 
     @torch.no_grad()
     def plan(
@@ -203,6 +311,8 @@ class ObjectTrajectoryCEMPlanner:
         obstacle_points: Optional[torch.Tensor] = None,
         object_mask: Optional[torch.Tensor] = None,
         point_mask: Optional[torch.Tensor] = None,
+        phase_context: Optional[torch.Tensor] = None,
+        max_phases: Optional[int] = None,
         generator: Optional[torch.Generator] = None,
     ) -> PlanningResult:
         """返回最优世界模型点云轨迹及对应的物体级执行动作。"""
@@ -215,6 +325,13 @@ class ObjectTrajectoryCEMPlanner:
             object_mask = torch.ones(b, o, dtype=torch.bool, device=current_objects.device)
         if point_mask is None:
             point_mask = torch.ones(b, o, n, dtype=torch.bool, device=current_objects.device)
+        if phase_context is None:
+            phase_context = torch.zeros(
+                b,
+                self.config.phase_context_dim,
+                dtype=current_objects.dtype,
+                device=current_objects.device,
+            )
         device, dtype = current_objects.device, current_objects.dtype
         frames = canonicalize_objects(current_objects, object_mask & point_mask.any(dim=-1)).frame
         mean, std = self._initial_distribution(b, o, device, dtype)
@@ -222,6 +339,9 @@ class ObjectTrajectoryCEMPlanner:
         best_trajectory = None
         best_world_actions = None
         best_local_action = None
+        best_phase_logits = None
+        best_phase_boundary_logits = None
+        best_phase_count_logits = None
         best_terms = None
         num_samples = max(self.config.num_elites + 1, self.config.num_samples)
         num_elites = min(self.config.num_elites, num_samples)
@@ -256,18 +376,59 @@ class ObjectTrajectoryCEMPlanner:
             repeated_objects = current_objects[:, None].expand(-1, num_samples, -1, -1, -1).reshape(flat_batch, o, n, 3)
             repeated_object_mask = object_mask[:, None].expand(-1, num_samples, -1).reshape(flat_batch, o)
             repeated_point_mask = point_mask[:, None].expand(-1, num_samples, -1, -1).reshape(flat_batch, o, n)
-            rollout = self.world_model.rollout(
+            repeated_phase_context = phase_context[:, None, None].expand(
+                -1,
+                num_samples,
+                self.config.horizon,
+                -1,
+            ).reshape(flat_batch, self.config.horizon, self.config.phase_context_dim)
+            world_output = self.world_model.rollout(
                 repeated_objects,
                 flattened_actions,
                 object_mask=repeated_object_mask,
                 point_mask=repeated_point_mask,
-            )["objects"].reshape(b, num_samples, self.config.horizon, o, n, 3)
+                phase_context=repeated_phase_context,
+            )
+            rollout = world_output["objects"].reshape(
+                b,
+                num_samples,
+                self.config.horizon,
+                o,
+                n,
+                3,
+            )
+            rollout_phase_logits = world_output["phase_logits"].reshape(
+                b,
+                num_samples,
+                self.config.horizon,
+                o,
+                self.config.num_phase_types,
+            )
+            rollout_phase_boundary_logits = world_output[
+                "phase_boundary_logits"
+            ].reshape(
+                b,
+                num_samples,
+                self.config.horizon,
+                o,
+            )
+            rollout_phase_count_logits = world_output[
+                "phase_count_logits"
+            ].reshape(
+                b,
+                num_samples,
+                self.config.num_phase_types,
+            )
             costs = self._score(
                 rollout,
                 goal_objects,
                 obstacle_points,
                 object_mask,
                 point_mask=point_mask[:, None].expand(-1, num_samples, -1, -1),
+                phase_logits=rollout_phase_logits,
+                phase_boundary_logits=rollout_phase_boundary_logits,
+                phase_count_logits=rollout_phase_count_logits,
+                max_phases=max_phases,
             )
             total_costs = costs[0]
             elite_index = total_costs.topk(num_elites, dim=1, largest=False).indices
@@ -302,6 +463,15 @@ class ObjectTrajectoryCEMPlanner:
                 best_trajectory = gather_candidate(rollout).detach()
                 best_world_actions = gather_candidate(world_actions).detach()
                 best_local_action = gather_candidate(noisy).detach()
+                best_phase_logits = gather_candidate(
+                    rollout_phase_logits
+                ).detach()
+                best_phase_boundary_logits = gather_candidate(
+                    rollout_phase_boundary_logits
+                ).detach()
+                best_phase_count_logits = gather_candidate(
+                    rollout_phase_count_logits
+                ).detach()
                 best_terms = tuple(gather_candidate(term).detach() for term in costs[1:])
             else:
                 improved = candidate_cost < best_cost
@@ -316,6 +486,40 @@ class ObjectTrajectoryCEMPlanner:
                     best_world_actions = torch.where(choose, world_candidate.detach(), best_world_actions)
                     choose = improved.view(-1, *([1] * (local_candidate.ndim - 1)))
                     best_local_action = torch.where(choose, local_candidate.detach(), best_local_action)
+                    phase_candidate = gather_candidate(rollout_phase_logits)
+                    choose = improved.view(
+                        -1,
+                        *([1] * (phase_candidate.ndim - 1)),
+                    )
+                    best_phase_logits = torch.where(
+                        choose,
+                        phase_candidate.detach(),
+                        best_phase_logits,
+                    )
+                    boundary_candidate = gather_candidate(
+                        rollout_phase_boundary_logits
+                    )
+                    choose = improved.view(
+                        -1,
+                        *([1] * (boundary_candidate.ndim - 1)),
+                    )
+                    best_phase_boundary_logits = torch.where(
+                        choose,
+                        boundary_candidate.detach(),
+                        best_phase_boundary_logits,
+                    )
+                    count_candidate = gather_candidate(
+                        rollout_phase_count_logits
+                    )
+                    choose = improved.view(
+                        -1,
+                        *([1] * (count_candidate.ndim - 1)),
+                    )
+                    best_phase_count_logits = torch.where(
+                        choose,
+                        count_candidate.detach(),
+                        best_phase_count_logits,
+                    )
                     updated_terms = []
                     for old, new in zip(best_terms, term_candidates):
                         choose = improved.view(-1, *([1] * (new.ndim - 1)))
@@ -325,10 +529,21 @@ class ObjectTrajectoryCEMPlanner:
 
         if best_trajectory is None or best_cost is None or best_terms is None:
             raise RuntimeError("CEM planner did not produce a valid candidate")
+        phase_ids = decode_monotonic_phases(
+            best_phase_logits[:, None],
+            best_phase_count_logits[:, None],
+            max_phases=max_phases,
+        )[:, 0]
+        (
+            staged_trajectory,
+            phase_goal_points,
+            phase_boundaries,
+            phase_count,
+        ) = build_staged_trajectory(best_trajectory, phase_ids)
         self._previous_mean = mean.detach()
-        terminal, coll, smooth, interaction = best_terms
+        terminal, coll, smooth, interaction, stage = best_terms
         return PlanningResult(
-            subgoal_trajectory=best_trajectory,
+            subgoal_trajectory=staged_trajectory,
             world_actions=best_world_actions,
             local_action=best_local_action,
             total_costs=best_cost,
@@ -336,7 +551,12 @@ class ObjectTrajectoryCEMPlanner:
             collision_costs=coll,
             smoothness_costs=smooth,
             interaction_costs=interaction,
+            stage_costs=stage,
             mean=mean.detach(),
             std=std.detach(),
+            phase_ids=phase_ids,
+            phase_boundaries=phase_boundaries,
+            phase_goal_points=phase_goal_points,
+            phase_count=phase_count,
         )
 

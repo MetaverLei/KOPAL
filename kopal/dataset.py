@@ -1,7 +1,8 @@
 """KOPAL 轨迹数据格式与滑动窗口数据集。
 
-本文件定义场景点云、关键物体固定对应点轨迹、机器人状态和动作的联合数据
-格式，并实现滑动窗口切分、NPZ 读写和用于接口验证的确定性合成轨迹生成。
+本文件定义场景点云、关键物体固定对应点轨迹、机器人状态、动作和可选阶段
+标签的联合数据格式，并实现滑动窗口切分、NPZ 读写和用于接口验证的确定性
+合成轨迹生成。
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import torch
 from torch.utils.data import Dataset
 
 from .geometry import apply_object_action, interpolate_rigid, se3_exp
+from .phases import build_staged_trajectory
 
 try:
     import numpy as np
@@ -30,6 +32,11 @@ class TrajectoryTensors:
     object_mask: Optional[torch.Tensor] = None
     point_mask: Optional[torch.Tensor] = None
     episode_lengths: Optional[torch.Tensor] = None
+    phase_ids: Optional[torch.Tensor] = None
+    phase_boundary: Optional[torch.Tensor] = None
+    phase_goal_points: Optional[torch.Tensor] = None
+    phase_mask: Optional[torch.Tensor] = None
+    phase_count: Optional[torch.Tensor] = None
 
     def __post_init__(self) -> None:
         if self.scene_points.ndim != 4 or self.scene_points.shape[-1] != 3:
@@ -53,6 +60,30 @@ class TrajectoryTensors:
                 raise ValueError("episode_lengths must have shape (E,)")
             if ((self.episode_lengths <= 0) | (self.episode_lengths > steps)).any():
                 raise ValueError("episode_lengths must be within the padded trajectory length")
+        if self.phase_ids is not None and self.phase_ids.shape != (
+            episodes,
+            steps,
+            objects,
+        ):
+            raise ValueError("phase_ids has an inconsistent shape")
+        if self.phase_boundary is not None and self.phase_boundary.shape != (
+            episodes,
+            steps,
+            objects,
+        ):
+            raise ValueError("phase_boundary has an inconsistent shape")
+        if self.phase_goal_points is not None:
+            if self.phase_goal_points.ndim != 5 or self.phase_goal_points.shape[:1] != (episodes,):
+                raise ValueError("phase_goal_points must be (E,K,O,N,3)")
+            if self.phase_goal_points.shape[2:4] != (objects, object_points):
+                raise ValueError("phase_goal_points has an inconsistent object or point count")
+            if self.phase_mask is not None and self.phase_mask.shape != (
+                episodes,
+                self.phase_goal_points.shape[1],
+            ):
+                raise ValueError("phase_mask has an inconsistent shape")
+        if self.phase_count is not None and self.phase_count.shape != (episodes,):
+            raise ValueError("phase_count must have shape (E,)")
 
     def to(self, device: str | torch.device) -> "TrajectoryTensors":
         return TrajectoryTensors(
@@ -63,6 +94,11 @@ class TrajectoryTensors:
             self.object_mask.to(device) if self.object_mask is not None else None,
             self.point_mask.to(device) if self.point_mask is not None else None,
             self.episode_lengths.to(device) if self.episode_lengths is not None else None,
+            self.phase_ids.to(device) if self.phase_ids is not None else None,
+            self.phase_boundary.to(device) if self.phase_boundary is not None else None,
+            self.phase_goal_points.to(device) if self.phase_goal_points is not None else None,
+            self.phase_mask.to(device) if self.phase_mask is not None else None,
+            self.phase_count.to(device) if self.phase_count is not None else None,
         )
 
 
@@ -130,6 +166,21 @@ class SlidingWindowTrajectoryDataset(Dataset):
         subgoal = self._gather_future(
             data.object_points[episode], start + 1, self.policy_horizon
         )
+        if (
+            data.phase_ids is not None
+            and (data.phase_count is None or int(data.phase_count[episode]) > 1)
+        ):
+            episode_length = (
+                int(data.episode_lengths[episode])
+                if data.episode_lengths is not None
+                else data.object_points.shape[1]
+            )
+            staged, _, _, _ = build_staged_trajectory(
+                data.object_points[episode, start:episode_length].unsqueeze(0),
+                data.phase_ids[episode, start:episode_length].unsqueeze(0),
+                target_steps=self.policy_horizon,
+            )
+            subgoal = staged[0]
         actions = self._gather_future(data.actions[episode], start, self.policy_horizon)
         output = {
             "scene_points": scene,
@@ -151,6 +202,20 @@ class SlidingWindowTrajectoryDataset(Dataset):
             output["subgoal_point_mask"] = self._gather_future(
                 data.point_mask[episode], start + 1, self.policy_horizon
             )
+        if data.phase_ids is not None:
+            output["phase_id"] = self._gather_future(
+                data.phase_ids[episode], start + 1, self.world_horizon
+            )
+        if data.phase_boundary is not None:
+            output["phase_boundary"] = self._gather_future(
+                data.phase_boundary[episode], start + 1, self.world_horizon
+            )
+        if data.phase_goal_points is not None:
+            output["phase_goal_points"] = data.phase_goal_points[episode]
+        if data.phase_mask is not None:
+            output["phase_mask"] = data.phase_mask[episode]
+        if data.phase_count is not None:
+            output["phase_count"] = data.phase_count[episode]
         return output
 
     @property
@@ -239,6 +304,31 @@ def load_npz_trajectory_dataset(path: str | Path) -> TrajectoryTensors:
             if "episode_lengths" in arrays
             else None
         ),
+        phase_ids=(
+            torch.as_tensor(arrays["phase_ids"]).long()
+            if "phase_ids" in arrays
+            else None
+        ),
+        phase_boundary=(
+            torch.as_tensor(arrays["phase_boundary"]).bool()
+            if "phase_boundary" in arrays
+            else None
+        ),
+        phase_goal_points=(
+            torch.as_tensor(arrays["phase_goal_points"]).float()
+            if "phase_goal_points" in arrays
+            else None
+        ),
+        phase_mask=(
+            torch.as_tensor(arrays["phase_mask"]).bool()
+            if "phase_mask" in arrays
+            else None
+        ),
+        phase_count=(
+            torch.as_tensor(arrays["phase_count"]).long()
+            if "phase_count" in arrays
+            else None
+        ),
     )
 
 
@@ -260,6 +350,16 @@ def save_npz_trajectory_dataset(tensors: TrajectoryTensors, path: str | Path) ->
         arrays["point_mask"] = tensors.point_mask.detach().cpu().numpy()
     if tensors.episode_lengths is not None:
         arrays["episode_lengths"] = tensors.episode_lengths.detach().cpu().numpy()
+    if tensors.phase_ids is not None:
+        arrays["phase_ids"] = tensors.phase_ids.detach().cpu().numpy()
+    if tensors.phase_boundary is not None:
+        arrays["phase_boundary"] = tensors.phase_boundary.detach().cpu().numpy()
+    if tensors.phase_goal_points is not None:
+        arrays["phase_goal_points"] = tensors.phase_goal_points.detach().cpu().numpy()
+    if tensors.phase_mask is not None:
+        arrays["phase_mask"] = tensors.phase_mask.detach().cpu().numpy()
+    if tensors.phase_count is not None:
+        arrays["phase_count"] = tensors.phase_count.detach().cpu().numpy()
     np.savez_compressed(path, **arrays)
 
 

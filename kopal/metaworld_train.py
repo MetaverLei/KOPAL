@@ -363,6 +363,7 @@ def _update_subgoal(
     device: str,
     requires_grasp: bool,
     grasp_width_threshold: float,
+    max_phases: Optional[int],
 ) -> float:
     distance = torch.linalg.vector_norm(
         observation.robot_state[0, :3] - observation.object_center[0]
@@ -412,6 +413,8 @@ def _update_subgoal(
             observation.goal_objects,
             object_mask=object_mask,
             point_mask=point_mask,
+            phase_context=observation.robot_state[-1:],
+            max_phases=max_phases,
         )
     return float(distance)
 
@@ -463,6 +466,7 @@ def evaluate(args: argparse.Namespace) -> Dict[str, float]:
                     "assembly-v3",
                 },
                 grasp_width_threshold=args.grasp_width_threshold,
+                max_phases=args.max_phases,
             )
             scene_history = [observation.scene_points[0], observation.scene_points[0]]
             state_history = [observation.robot_state[0], observation.robot_state[0]]
@@ -485,6 +489,7 @@ def evaluate(args: argparse.Namespace) -> Dict[str, float]:
                             "assembly-v3",
                         },
                         grasp_width_threshold=args.grasp_width_threshold,
+                        max_phases=args.max_phases,
                     )
                 prediction = system.act(
                     torch.stack(scene_history[-2:]).unsqueeze(0).to(device),
@@ -564,6 +569,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--replan-every", type=int, default=4)
     parser.add_argument("--approach-threshold", type=float, default=0.10)
     parser.add_argument("--grasp-width-threshold", type=float, default=0.06)
+    parser.add_argument("--max-phases", type=int, choices=(1, 2, 3), default=None)
     parser.add_argument("--use-policy-ema", action="store_true")
     return parser.parse_args()
 

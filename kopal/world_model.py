@@ -1,8 +1,9 @@
 """KOPAL 的关键物体三维点流世界模型。
 
 本文件在物体局部规范坐标中预测固定对应点的未来位置，结合显式刚体位姿和
-学习残差描述物体动力学，并支持 JEPA 潜空间预测、目标编码器指数滑动平均
-以及潜变量方差和协方差正则化。
+学习残差描述物体动力学，并通过阶段辅助头预测当前阶段、阶段边界和终止
+阶段编号。世界模型同时支持 JEPA 潜空间预测、目标编码器指数滑动平均以及
+潜变量方差和协方差正则化。
 """
 
 from __future__ import annotations
@@ -66,6 +67,25 @@ class ObjectPointFlowWorldModel(nn.Module):
             ]
         )
         self.decoder = mlp(object_dim * 2 + 6 + 4, object_dim, 3, layers=3)
+        self.phase_head = mlp(
+            object_dim,
+            object_dim,
+            self.config.num_phase_types,
+            layers=2,
+        )
+        self.phase_boundary_head = mlp(object_dim, object_dim, 1, layers=2)
+        self.phase_count_head = mlp(
+            object_dim,
+            object_dim,
+            self.config.num_phase_types,
+            layers=2,
+        )
+        self.phase_context_proj = mlp(
+            self.config.phase_context_dim,
+            object_dim,
+            object_dim,
+            layers=2,
+        )
 
         self.latent_projector = mlp(
             self.config.encoder.global_dim,
@@ -130,6 +150,8 @@ class ObjectPointFlowWorldModel(nn.Module):
         actions: torch.Tensor,
         object_mask: Optional[torch.Tensor] = None,
         point_mask: Optional[torch.Tensor] = None,
+        phase_context: Optional[torch.Tensor] = None,
+        time_index: Optional[torch.Tensor] = None,
         return_latent: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """使用物体级 SE(3) 旋量执行一步未来点云预测。
@@ -139,6 +161,8 @@ class ObjectPointFlowWorldModel(nn.Module):
             actions：形状为 ``(B,O,6)`` 的世界坐标 SE(3) 动作。
             object_mask：形状为 ``(B,O)`` 的物体有效性掩码。
             point_mask：形状为 ``(B,O,N)`` 的点有效性掩码。
+            phase_context：形状为 ``(B,Ds)`` 的当前机器人或阶段上下文。
+            time_index：形状为 ``(B,O)`` 的归一化 rollout 时间索引。
         """
         if current_objects.ndim != 4:
             raise ValueError(f"step expects (B,O,N,3), got {tuple(current_objects.shape)}")
@@ -149,6 +173,18 @@ class ObjectPointFlowWorldModel(nn.Module):
             object_mask = torch.ones(b, o, dtype=torch.bool, device=current_objects.device)
         if point_mask is None:
             point_mask = torch.ones(b, o, n, dtype=torch.bool, device=current_objects.device)
+        if phase_context is None:
+            phase_context = torch.zeros(
+                b,
+                self.config.phase_context_dim,
+                dtype=current_objects.dtype,
+                device=current_objects.device,
+            )
+        elif phase_context.shape != (b, self.config.phase_context_dim):
+            raise ValueError(
+                f"phase_context must be {(b, self.config.phase_context_dim)}, "
+                f"got {tuple(phase_context.shape)}"
+            )
 
         valid_object_mask = object_mask & point_mask.any(dim=-1)
         canonical = canonicalize_objects(current_objects, valid_object_mask)
@@ -163,10 +199,22 @@ class ObjectPointFlowWorldModel(nn.Module):
 
         per_point, _ = self._encode_objects(local_points, point_mask)
         point_tokens = self.point_proj(per_point)
+        if time_index is None:
+            time_index = torch.zeros_like(local_action[..., 0])
         action_context = self.action_encoder(
-            torch.cat((local_action, sinusoidal_time_embedding(torch.ones_like(local_action[..., 0]), 32)), dim=-1)
+            torch.cat(
+                (
+                    local_action,
+                    sinusoidal_time_embedding(time_index, 32),
+                ),
+                dim=-1,
+            )
         )
-        object_tokens = point_tokens.max(dim=-2).values + action_context
+        object_tokens = (
+            point_tokens.max(dim=-2).values
+            + action_context
+            + self.phase_context_proj(phase_context).unsqueeze(1)
+        )
         object_tokens = self.object_norm(object_tokens)
         invalid_object_mask = ~valid_object_mask
         for block in self.object_context:
@@ -199,6 +247,9 @@ class ObjectPointFlowWorldModel(nn.Module):
             "residual": residual,
             "object_tokens": object_tokens,
             "local_actions": local_action,
+            "phase_logits": self.phase_head(object_tokens),
+            "phase_boundary_logits": self.phase_boundary_head(object_tokens).squeeze(-1),
+            "phase_count_logits": self.phase_count_head(object_tokens[:, 0]),
         }
         if return_latent:
             valid_points = point_mask.any(dim=-1).to(predicted_local.dtype).unsqueeze(-1)
@@ -213,6 +264,7 @@ class ObjectPointFlowWorldModel(nn.Module):
         actions: torch.Tensor,
         object_mask: Optional[torch.Tensor] = None,
         point_mask: Optional[torch.Tensor] = None,
+        phase_context: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """根据 ``(B,T,O,6)`` 世界坐标动作自回归推演未来点云轨迹。"""
         if actions.ndim != 4 or actions.shape[-1] != 6:
@@ -223,14 +275,35 @@ class ObjectPointFlowWorldModel(nn.Module):
         current = current_objects
         trajectory = []
         residuals = []
+        phase_logits = []
+        phase_boundary_logits = []
         for k in range(t):
-            output = self.step(current, actions[:, k], object_mask=object_mask, point_mask=point_mask)
+            output = self.step(
+                current,
+                actions[:, k],
+                object_mask=object_mask,
+                point_mask=point_mask,
+                phase_context=(
+                    phase_context[:, k] if phase_context is not None else None
+                ),
+                time_index=torch.full(
+                    (b, o),
+                    k / max(t - 1, 1),
+                    dtype=current.dtype,
+                    device=current.device,
+                ),
+            )
             current = output["next_objects"]
             trajectory.append(current)
             residuals.append(output["residual"])
+            phase_logits.append(output["phase_logits"])
+            phase_boundary_logits.append(output["phase_boundary_logits"])
         return {
             "objects": torch.stack(trajectory, dim=1),
             "residuals": torch.stack(residuals, dim=1),
+            "phase_logits": torch.stack(phase_logits, dim=1),
+            "phase_boundary_logits": torch.stack(phase_boundary_logits, dim=1),
+            "phase_count_logits": output["phase_count_logits"],
         }
 
     def forward(
@@ -240,6 +313,7 @@ class ObjectPointFlowWorldModel(nn.Module):
         actions: Optional[torch.Tensor] = None,
         object_mask: Optional[torch.Tensor] = None,
         point_mask: Optional[torch.Tensor] = None,
+        phase_context: Optional[torch.Tensor] = None,
         return_latent: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """执行教师强制约束下的多步前向预测。
@@ -259,6 +333,19 @@ class ObjectPointFlowWorldModel(nn.Module):
             object_mask = torch.ones(b, t, o, dtype=torch.bool, device=current.device)
         if point_mask is None:
             point_mask = torch.ones(b, t, o, n, dtype=torch.bool, device=current.device)
+        if phase_context is None:
+            phase_context = torch.zeros(
+                b,
+                t,
+                self.config.phase_context_dim,
+                dtype=current.dtype,
+                device=current.device,
+            )
+        elif phase_context.shape != (b, t, self.config.phase_context_dim):
+            raise ValueError(
+                f"phase_context must be {(b, t, self.config.phase_context_dim)}, "
+                f"got {tuple(phase_context.shape)}"
+            )
         if actions is None:
             inferred_rotation, inferred_translation = estimate_object_action(
                 current.reshape(b * t * o, n, 3),
@@ -276,16 +363,27 @@ class ObjectPointFlowWorldModel(nn.Module):
         residuals = []
         predicted_embeddings = []
         predicted_encoder_features = []
+        phase_logits = []
+        phase_boundary_logits = []
         for k in range(t):
             output = self.step(
                 current[:, k],
                 actions[:, k],
                 object_mask=object_mask[:, k],
                 point_mask=point_mask[:, k],
+                phase_context=phase_context[:, k],
+                time_index=torch.full(
+                    (b, o),
+                    k / max(t - 1, 1),
+                    dtype=current.dtype,
+                    device=current.device,
+                ),
                 return_latent=return_latent,
             )
             predictions.append(output["next_objects"])
             residuals.append(output["residual"])
+            phase_logits.append(output["phase_logits"])
+            phase_boundary_logits.append(output["phase_boundary_logits"])
             if return_latent:
                 predicted_embeddings.append(output["predicted_embedding"])
                 predicted_encoder_features.append(output["predicted_encoder_feature"])
@@ -294,6 +392,9 @@ class ObjectPointFlowWorldModel(nn.Module):
             "next_objects": torch.stack(predictions, dim=1),
             "residuals": torch.stack(residuals, dim=1),
             "actions": actions,
+            "phase_logits": torch.stack(phase_logits, dim=1),
+            "phase_boundary_logits": torch.stack(phase_boundary_logits, dim=1),
+            "phase_count_logits": output["phase_count_logits"],
         }
         if return_latent:
             result["predicted_embedding"] = torch.stack(predicted_embeddings, dim=1)
@@ -310,8 +411,12 @@ class ObjectPointFlowWorldModel(nn.Module):
         object_mask: Optional[torch.Tensor] = None,
         point_mask: Optional[torch.Tensor] = None,
         rigid_object_mask: Optional[torch.Tensor] = None,
+        phase_id: Optional[torch.Tensor] = None,
+        phase_boundary: Optional[torch.Tensor] = None,
+        phase_context: Optional[torch.Tensor] = None,
+        phase_count: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """计算几何回归、无未来泄漏的 JEPA 预测损失和潜变量正则项。"""
+        """计算几何回归、阶段辅助损失、JEPA 预测损失和潜变量正则项。"""
         current, _ = self._expand_leading(current_objects)
         target, _ = self._expand_leading(target_objects)
         b, t, o, n, _ = current.shape
@@ -319,6 +424,11 @@ class ObjectPointFlowWorldModel(nn.Module):
             object_mask = torch.ones(b, t, o, dtype=torch.bool, device=current.device)
         if point_mask is None:
             point_mask = torch.ones(b, t, o, n, dtype=torch.bool, device=current.device)
+        if phase_context is not None and phase_context.shape == (
+            b,
+            self.config.phase_context_dim,
+        ):
+            phase_context = phase_context[:, None].expand(-1, t, -1)
         use_latent = self.config.use_jepa
         output = self.forward(
             current,
@@ -326,6 +436,7 @@ class ObjectPointFlowWorldModel(nn.Module):
             actions=actions,
             object_mask=object_mask,
             point_mask=point_mask,
+            phase_context=phase_context,
             return_latent=use_latent,
         )
         pred = output["next_objects"]
@@ -345,6 +456,41 @@ class ObjectPointFlowWorldModel(nn.Module):
             )
             total = total + self.config.rigid_loss_weight * rigid
             losses["wm_rigid_loss"] = rigid
+
+        valid_object_mask = object_mask & point_mask.any(dim=-1)
+        if phase_id is not None:
+            phase_target = phase_id.long().clamp(
+                0,
+                self.config.num_phase_types - 1,
+            )
+            phase_loss = F.cross_entropy(
+                output["phase_logits"][valid_object_mask],
+                phase_target[valid_object_mask],
+            )
+            total = total + self.config.phase_loss_weight * phase_loss
+            losses["wm_phase_loss"] = phase_loss
+        if phase_boundary is not None:
+            boundary_logits = output["phase_boundary_logits"][valid_object_mask]
+            boundary_target = phase_boundary.to(boundary_logits.dtype)[
+                valid_object_mask
+            ]
+            boundary_loss = F.binary_cross_entropy_with_logits(
+                boundary_logits,
+                boundary_target,
+            )
+            total = total + self.config.phase_boundary_loss_weight * boundary_loss
+            losses["wm_phase_boundary_loss"] = boundary_loss
+        if phase_count is not None:
+            count_target = (phase_count.long() - 1).clamp(
+                0,
+                self.config.num_phase_types - 1,
+            )
+            count_loss = F.cross_entropy(
+                output["phase_count_logits"],
+                count_target,
+            )
+            total = total + self.config.phase_count_loss_weight * count_loss
+            losses["wm_phase_count_loss"] = count_loss
 
         if use_latent:
             # 预测点位于当前物体的规范坐标中，未来目标也必须使用当前物体的

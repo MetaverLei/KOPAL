@@ -1,8 +1,8 @@
 # KOPAL
 
-KOPAL（Key-Object Point-cloud Action Link）是一个分层机器人操作模型。高层世界模型预测关键物体的固定对应点云轨迹，CEM 规划器在该轨迹空间中生成子目标，底层 MeanFlow 策略读取子目标轨迹并生成动作块。
+KOPAL（Key-Object Point-cloud Action Link）是一个分层机器人操作模型。高层世界模型预测关键物体的固定对应点云轨迹，并通过阶段辅助头判断接近、抓取和运输等阶段；CEM 规划器在轨迹空间中生成阶段化子目标，底层 MeanFlow 策略读取子目标轨迹并生成动作块。
 
-世界模型与策略之间只传递形状为 `(B, H, O, N, 3)` 的关键物体点云轨迹，不在接口中插入潜变量或图像子目标。
+世界模型与策略之间只传递形状为 `(B, H, O, N, 3)` 的关键物体点云轨迹，不在接口中插入潜变量、离散阶段编号或图像子目标。阶段信息只用于世界模型训练、CEM 评分和点云轨迹组织。
 
 代码仓库：[MetaverLei/KOPAL](https://github.com/MetaverLei/KOPAL.git)
 
@@ -12,6 +12,7 @@ KOPAL（Key-Object Point-cloud Action Link）是一个分层机器人操作模�
 RGB-D 点云与关键物体固定对应点
     -> 关键物体点流世界模型
     -> 物体级 SE(3) 动作条件
+    -> 阶段与阶段边界预测
     -> CEM 规划
     -> 关键物体点云子目标轨迹 (B,H,O,N,3)
     -> 轨迹缓冲与时间推进
@@ -24,6 +25,8 @@ RGB-D 点云与关键物体固定对应点
 - 使用层次点云编码器提取逐点特征和全局特征。
 - 在物体 PCA 规范坐标中预测固定对应点的未来位置。
 - 输出由显式刚体动作和神经网络残差组成。
+- 通过阶段头预测当前阶段、下一时刻阶段边界和终止阶段编号。
+- 阶段上下文与机器人状态共同参与物体 token 编码。
 - JEPA 预测目标使用当前物体规范坐标，保留刚体相对运动。
 - 默认在原始投影空间计算 JEPA 均方误差、方差和协方差，避免单位向量归一化导致方差目标不可达。
 - 目标编码器和目标投影器使用指数滑动平均，不接收梯度。
@@ -41,6 +44,14 @@ loss =
   + 0.09 * SIGReg
 ```
 
+数据包含阶段标签时，世界模型还会加入：
+
+```text
+  + 1.0 * phase_cross_entropy
+  + 0.5 * phase_boundary_binary_cross_entropy
+  + 0.5 * terminal_phase_cross_entropy
+```
+
 训练日志分别记录 `wm_flow_loss`、`wm_jepa_loss`、`wm_jepa_weight`、
 `wm_variance_loss`、`wm_covariance_loss`、`wm_normalized_variance_loss`、
 `wm_normalized_covariance_loss`、`wm_latent_std_mean`、`wm_sigreg_loss`
@@ -55,9 +66,10 @@ CEM 规划器在物体局部 SE(3) 空间采样动作，通过世界模型生成
 - Chamfer 距离；
 - 障碍碰撞；
 - 轨迹平滑性；
-- 物体之间交互。
+- 物体之间交互；
+- 阶段单调性、阶段边界一致性和终止阶段覆盖。
 
-规划器输出世界模型实际推演得到的点云轨迹，不输出独立于世界模型的抽象动作。
+规划器输出世界模型实际推演并阶段化的关键物体点云轨迹，不输出独立于世界模型的抽象动作。`max_phases=1` 会关闭阶段代价并保持单阶段轨迹，适用于没有任务阶段切换的操作。
 
 ### 策略
 
@@ -82,6 +94,7 @@ MeanFlow 策略的输入包括：
 | `kopal/dataset.py` | 轨迹数据结构、滑动窗口、NPZ 读写和合成数据生成 |
 | `kopal/modules.py` | 点云编码器、特征传播、时间编码、注意力和条件 Transformer 块 |
 | `kopal/world_model.py` | 关键物体点流世界模型与 JEPA 训练目标 |
+| `kopal/phases.py` | 阶段标注、阶段轨迹生成和单调阶段解码 |
 | `kopal/planner.py` | 物体级 SE(3) CEM 规划器 |
 | `kopal/interface.py` | 世界模型到策略的子目标轨迹缓冲接口 |
 | `kopal/policy.py` | 1-NFE MeanFlow 动作策略 |
@@ -104,14 +117,47 @@ MeanFlow 策略的输入包括：
 | `object_mask` | `(E,T,O)` | 可选物体有效性掩码 |
 | `point_mask` | `(E,T,O,No)` | 可选逐点有效性掩码 |
 | `episode_lengths` | `(E,)` | 可选有效轨迹长度 |
+| `phase_ids` | `(E,T,O)` | 可选关键物体阶段标签 |
+| `phase_boundary` | `(E,T,O)` | 可选阶段边界标签 |
+| `phase_goal_points` | `(E,K,O,No,3)` | 可选各阶段目标点云 |
+| `phase_mask` | `(E,K)` | 可选有效阶段掩码 |
+| `phase_count` | `(E,)` | 可选每条轨迹的阶段总数（1 至 3） |
 
 `object_points` 中的同一点编号在整个 episode 内必须保持同一物理对应点。
+
+阶段标签可由世界模型数据接口自动生成：
+
+```python
+from dataclasses import replace
+
+from kopal.dataset import load_npz_trajectory_dataset, save_npz_trajectory_dataset
+from kopal.phases import infer_phase_annotations
+
+tensors = load_npz_trajectory_dataset("data/train.npz")
+phases = infer_phase_annotations(
+    tensors.object_points,
+    tensors.actions,
+    tensors.episode_lengths,
+    num_phases=3,
+)
+tensors = replace(
+    tensors,
+    phase_ids=phases.phase_ids,
+    phase_boundary=phases.phase_boundary,
+    phase_goal_points=phases.phase_goal_points,
+    phase_mask=phases.phase_mask,
+    phase_count=phases.phase_count,
+)
+save_npz_trajectory_dataset(tensors, "data/train_phase.npz")
+```
 
 滑动窗口数据同时提供：
 
 - `current_objects`：世界模型当前状态；
 - `target_objects`：世界模型下一步监督；
-- `subgoal_trajectory`：策略的未来轨迹条件；
+- `phase_id` 和 `phase_boundary`：世界模型下一步阶段监督；
+- `phase_count`：阶段总数监督；
+- `subgoal_trajectory`：策略的未来轨迹条件；多阶段轨迹会被压缩为保持阶段端点的点云轨迹；
 - `actions`：策略动作块监督。
 
 ## 安装
@@ -189,6 +235,7 @@ python -m kopal.metaworld_train --mode eval --task-name reach-v3 --checkpoint KO
 - `--replan-every`：世界模型与 CEM 重新规划间隔；
 - `--approach-threshold`：接近阶段切换阈值；
 - `--grasp-width-threshold`：抓取阶段夹爪宽度门限；
+- `--max-phases`：单次规划允许的最大阶段数，单阶段任务设为 1；
 - `--use-policy-ema`：加载策略 EMA 参数。
 
 ## Python 调用
@@ -205,6 +252,8 @@ system = KOPALSystem(config).to(config.device)
 system.update_subgoal(
     current_objects=torch.randn(1, 2, 64, 3, device=config.device),
     goal_objects=torch.randn(1, 2, 64, 3, device=config.device),
+    phase_context=torch.randn(1, 9, device=config.device),
+    max_phases=3,
 )
 
 actions = system.act(
@@ -220,6 +269,8 @@ actions = system.act(
 - 关键物体点云轨迹必须保持固定点对应关系。
 - 世界模型动作与规划器动作均使用物体级 SE(3) 增量。
 - 策略条件中的子目标轨迹使用 `(B,H,O,N,3)` 形状。
+- 阶段编号不得作为独立条件传入策略；阶段只能通过阶段化点云轨迹影响执行。
+- 单阶段任务应设置 `max_phases=1`，避免在线阶段误预测改变局部子目标。
 - 策略动作维度和机器人状态维度由 `PolicyConfig` 决定。
 - MetaWorld 配置使用 4 维动作、9 维机器人状态、16 步预测和 8 步执行。
 - 感知模块可惰性加载 Grounding DINO 与 SAM2；预计算点云和掩码可直接进入训练流程。

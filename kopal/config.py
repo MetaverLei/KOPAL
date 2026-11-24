@@ -1,8 +1,8 @@
 """KOPAL 模型配置定义。
 
-本文件集中定义点云编码器、世界模型、MeanFlow 策略、CEM 规划器和感知模块
-的配置字段及默认值。所有组件通过同一份配置构建，避免训练和推理阶段使用
-不一致的超参数。
+本文件集中定义点云编码器、世界模型、阶段辅助头、MeanFlow 策略、CEM
+规划器和感知模块的配置字段及默认值。所有组件通过同一份配置构建，避免
+训练和推理阶段使用不一致的超参数。
 """
 
 from __future__ import annotations
@@ -50,6 +50,11 @@ class WorldModelConfig:
     sigreg_num_proj: int = 256
     sigreg_knots: int = 17
     sigreg_chunk_size: int = 128
+    num_phase_types: int = 3
+    phase_loss_weight: float = 1.0
+    phase_boundary_loss_weight: float = 0.5
+    phase_count_loss_weight: float = 0.5
+    phase_context_dim: int = 9
 
 
 @dataclass
@@ -90,6 +95,8 @@ class PolicyConfig:
 
 @dataclass
 class PlannerConfig:
+    num_phase_types: int = 3
+    phase_context_dim: int = 9
     horizon: int = 8
     num_keyframes: int = 1
     num_samples: int = 32
@@ -109,6 +116,7 @@ class PlannerConfig:
     ema_alpha: float = 0.35
     use_warm_start: bool = True
     warm_start_decay: float = 0.8
+    stage_cost_weight: float = 0.2
 
 
 @dataclass
